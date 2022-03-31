@@ -7,7 +7,7 @@ contract PErc20 is PToken, PErc20Interface {
     event Log(string message);
     event LogBytes(bytes data);    
 
-    constructor(address underlying_,
+    constructor (address underlying_,
                 PBAdminInterface pbAdmin_,
                 InterestModelInterface interestModel_,
                 string memory name_,
@@ -16,7 +16,6 @@ contract PErc20 is PToken, PErc20Interface {
 
         super.initialize(pbAdmin_, interestModel_, name_, symbol_, decimals_);
         underlying = underlying_;
-        //EIP20Interface(underlying).totalSupply();
     }
 
     function mint(uint256 mintAmount) external returns (uint256) {

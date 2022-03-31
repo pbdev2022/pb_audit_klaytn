@@ -13,40 +13,60 @@ contract PTokenStorage {
     uint8 public decimals;
 
     uint256 internal constant borrowRateMaxMantissa = 0.0005e16;
+    uint256 internal constant supplyRateMaxMantissa = 0.0005e16;    
+    uint256 internal constant borrowRateGDRMaxMantissa = 0.0005e16;    
     uint256 internal constant reserveFactorMaxMantissa = 1e18;
 
-    address payable public admin;
-    address payable public pendingAdmin;
+    address public admin;
+    address public pendingAdmin;
 
     PBAdminInterface public pbAdmin;
 
     InterestModelInterface public interestModel;
 
     uint256 public reserveFactorMantissa;
-    uint256 public accrualBlockNumber;
+    
+    uint256 public accrualBorrowBlockNumber;    
+
     uint256 public borrowIndex;
     uint256 public totalBorrows;
     uint256 public totalReserves;
     uint256 public totalSupply;
+
+    uint256 public borrowGDRIndex;    
+
+    uint256 public supplyIndex;
+
+    uint256 public initalBlockNumber;
 
     mapping (address => uint256) internal accountTokens;
     mapping (address => mapping (address => uint256)) internal transferAllowances;
 
     struct BorrowSnapshot {
         uint256 principal;
-        uint256 purePrincipal;
         uint256 interestIndex;
+        uint256 interestGDRIndex;        
     }
 
     mapping(address => BorrowSnapshot) internal accountBorrows;
 
+    uint256 public accrualSupplyBlockNumber;
+
+    struct SupplySnapshot {
+        uint256 interestIndex;
+    }
+
+    mapping(address => SupplySnapshot) internal accountSupplys;
+
     uint256 public constant protocolSeizeShareMantissa = 2.8e16; //2.8%
+    uint256 public constant blocksPerDay = 5760;
 }
 
 contract PTokenInterface is PTokenStorage {
     bool public constant isPToken = true;
 
-    event AccrueInterest(uint256 cashPrior, uint256 interestAccumulated, uint256 borrowIndex, uint256 totalBorrows);
+    event AccrueBorrowInterest(uint256 cashPrior, uint256 interestAccumulated, uint256 borrowIndex, uint256 borrowGDRIndex, uint256 totalBorrows);
+    event AccrueSupplyInterest(uint256 cashPrior, uint256 interestAccumulated, uint256 supplyIndex, uint256 totalSupply);
     event Mint(address minter, uint256 mintAmount, uint256 mintTokens);
     event Redeem(address redeemer, uint256 redeemAmount, uint256 redeemTokens);
     event Borrow(address borrower, uint256 borrowAmount, uint256 accountBorrows, uint256 totalBorrows);
@@ -69,15 +89,16 @@ contract PTokenInterface is PTokenStorage {
     function allowance(address owner, address spender) external view returns (uint256);
     function balanceOf(address owner) external view returns (uint256);
     function balanceOfUnderlying(address owner) external view returns (uint256);
-    function getAccountSnapshot(address account) external view returns (uint256, uint256, uint256);
-    function borrowRatePerBlock() external view returns (uint256);
-    function supplyRatePerBlock() external view returns (uint256);
+    function getAccountSnapshot(address account) external view returns (uint256, uint256, uint256, uint256);
+    function borrowRatePerBlock() public view returns (uint256);
+    function supplyRatePerBlock() public view returns (uint256);
     function totalBorrowsCurrent() external returns (uint256);
     function borrowBalanceCurrent(address account) external returns (uint256);
     function borrowBalanceStored(address account) public view returns (uint256);
-    function borrowBalanceStored2(address account) public view returns (uint256, uint256);
+    function borrowGDRBalanceStored(address account) public view returns (uint256);
+    function supplyBalanceStored(address account) public view returns (uint256);
     function getCash() external view returns (uint256);
-    function accrueInterest() public returns (uint256);
+    function accrueInterest() public returns (uint256);    
     function seize(address liquidator, address borrower, uint256 seizeTokens) external returns (uint256);
     function getAccruedTokens() external view returns (uint256);
 
@@ -101,7 +122,7 @@ contract PErc20Interface is PErc20Storage {
     function repayBorrow(uint256 repayAmount) external returns (uint256);
     function repayBorrowBehalf(address borrower, uint256 repayAmount) external returns (uint256);
     function liquidateBorrow(address borrower, uint256 repayAmount, PTokenInterface pTokenCollateral) external returns (uint256);
-    function sweepToken(EIP20Interface token) external; 
+    function sweepToken(EIP20Interface token) external;
 
     function _addReserves(uint256 addAmount) external returns (uint256);
 }

@@ -22,14 +22,19 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
                         uint8 decimals_) public {
 
         require(msg.sender == admin, "PToken: only admin may initialize the market");
-        require(accrualBlockNumber == 0 && borrowIndex == 0, "PToken: market may only be initialized once");
-
+        require(accrualBorrowBlockNumber == 0 && borrowIndex == 0, "PToken: market may only be initialized once");
+		
         uint256 err = _setPBAdmin(pbAdmin_);
-
         require(err == uint256(Error.NO_ERROR), "PToken: setting PBAdmin failed");
 
-        accrualBlockNumber = getBlockNumber();
+        accrualBorrowBlockNumber = getBlockNumber();
+        accrualSupplyBlockNumber = getBlockNumber();        
+
         borrowIndex = mantissaOne;
+        borrowGDRIndex = mantissaOne;
+        supplyIndex = mantissaOne;        
+
+        initalBlockNumber = getBlockNumber();
 
         err = _setInterestModelFresh(interestModel_);
         require(err == uint256(Error.NO_ERROR), "PToken: setting interest rate model failed");
@@ -39,7 +44,6 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
         decimals = decimals_;
 
         _notEntered = true;
-
     }
 
     function transferTokens(address spender, address src, address dst, uint256 tokens) internal returns (uint256) {
@@ -56,6 +60,8 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
 
         MathError mathErr;
         uint256 allowanceNew;
+        uint256 srcTokensBefore;
+        uint256 dstTokensBefore;        
         uint256 srcTokensNew;
         uint256 dstTokensNew;
 
@@ -67,18 +73,31 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
             }
         }
 
-        (mathErr, srcTokensNew) = subRtn(accountTokens[src], tokens);
+        (mathErr, srcTokensBefore) = supplyBalanceStoredInternal(src);
+        if (mathErr != MathError.NO_ERROR) {
+            return fail(Error.MATH_ERROR, FailureInfo.SUPPLY_ACCUMULATED_BALANCE_CALCULATION_FAILED);
+        }
+
+        (mathErr, srcTokensNew) = subRtn(srcTokensBefore, tokens);
         if (mathErr != MathError.NO_ERROR) {
             return fail(Error.MATH_ERROR, FailureInfo.TRANSFER_NOT_ENOUGH);
         }
 
-        (mathErr, dstTokensNew) = addRtn(accountTokens[dst], tokens);
+        (mathErr, dstTokensBefore) = supplyBalanceStoredInternal(dst);
+        if (mathErr != MathError.NO_ERROR) {
+            return fail(Error.MATH_ERROR, FailureInfo.SUPPLY_ACCUMULATED_BALANCE_CALCULATION_FAILED);
+        }
+
+        (mathErr, dstTokensNew) = addRtn(dstTokensBefore, tokens);
         if (mathErr != MathError.NO_ERROR) {
             return fail(Error.MATH_ERROR, FailureInfo.TRANSFER_TOO_MUCH);
         }
 
         accountTokens[src] = srcTokensNew;
         accountTokens[dst] = dstTokensNew;
+
+        accountSupplys[src].interestIndex = supplyIndex;
+        accountSupplys[dst].interestIndex = supplyIndex;
 
         if (startingAllowance != 0) {
             transferAllowances[src][spender] = allowanceNew;
@@ -109,45 +128,68 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
     }
 
     function balanceOf(address owner) external view returns (uint256) {
-        return accountTokens[owner];
+        MathError mErr;
+        uint256 supplyBalance;
+        (mErr, supplyBalance) = supplyBalanceStoredInternal(owner);
+        if (mErr != MathError.NO_ERROR) {
+            return 0;
+        }
+        return supplyBalance;
     }
 
     function balanceOfUnderlying(address owner) external view returns (uint256) {
-        return accountTokens[owner];
+        MathError mErr;
+        uint256 supplyBalance;
+        (mErr, supplyBalance) = supplyBalanceStoredInternal(owner);
+        if (mErr != MathError.NO_ERROR) {
+            return 0;
+        }
+        return supplyBalance;
     }
 
-    function getAccountSnapshot(address account) external view returns (uint256, uint256, uint256) {
-        uint256 pTokenBalance = accountTokens[account];
+    function getAccountSnapshot(address account) external view returns (uint256, uint256, uint256, uint256) {
+        uint256 pTokenBalance;
         uint256 borrowBalance;
+        uint256 borrowGDRBalance;
 
         MathError mErr;
-        (mErr, borrowBalance) = borrowBalanceStoredInternal(account);
+        (mErr, pTokenBalance) = supplyBalanceStoredInternal(account);
         if (mErr != MathError.NO_ERROR) {
-            return (uint256(Error.MATH_ERROR), 0, 0);
+            return (uint256(Error.MATH_ERROR), 0, 0, 0);
         }
 
-        return (uint256(Error.NO_ERROR), pTokenBalance, borrowBalance);
+        (mErr, borrowBalance) = borrowBalanceStoredInternal(account);
+        if (mErr != MathError.NO_ERROR) {
+            return (uint256(Error.MATH_ERROR), 0, 0, 0);
+        }
+
+        (mErr, borrowGDRBalance) = borrowGDRBalanceStoredInternal(account);
+        if (mErr != MathError.NO_ERROR) {
+            return (uint256(Error.MATH_ERROR), 0, 0, 0);
+        }        
+
+        return (uint256(Error.NO_ERROR), pTokenBalance, borrowBalance, borrowGDRBalance);
     }
 
     function getBlockNumber() internal view returns (uint256) {
         return block.number;
     }
 
-    function borrowRatePerBlock() external view returns (uint256) {
+    function borrowRatePerBlock() public view returns (uint256) {    
         return interestModel.getBorrowRate(getCashPrior(), totalBorrows, totalReserves);
     }
 
-    function supplyRatePerBlock() external view returns (uint256) {
-        return interestModel.getSupplyRate(getCashPrior(), totalBorrows, totalReserves);
+    function supplyRatePerBlock() public view returns (uint256) {    
+        return interestModel.getSupplyRate(getCashPrior(), totalBorrows, totalReserves, reserveFactorMantissa);
     }
 
     function totalBorrowsCurrent() external nonReentrant returns (uint256) {
-        require(accrueInterest() == uint256(Error.NO_ERROR), "PToken: accrue interest failed");
+        require(accrueInterest() == uint256(Error.NO_ERROR), "PToken: accrue borrow interest failed");
         return totalBorrows;
     }
 
     function borrowBalanceCurrent(address account) external nonReentrant returns (uint256) {
-        require(accrueInterest() == uint256(Error.NO_ERROR), "PToken: accrue interest failed");
+        require(accrueInterest() == uint256(Error.NO_ERROR), "PToken: accrue borrow interest failed");
         return borrowBalanceStored(account);
     }
 
@@ -156,12 +198,6 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
         require(err == MathError.NO_ERROR, "PToken: borrowBalanceStoredInternal failed");
         return result;
     }
-
-    function borrowBalanceStored2(address account) public view returns (uint256, uint256) {
-        (MathError err, uint256 result, uint256 purePrincipal) = borrowBalanceStoredInternal2(account);
-        require(err == MathError.NO_ERROR, "PToken: borrowBalanceStoredInternal failed");
-        return (result, purePrincipal);
-    }    
 
     function borrowBalanceStoredInternal(address account) internal view returns (MathError, uint256) {
         MathError mathErr;
@@ -187,71 +223,238 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
         return (MathError.NO_ERROR, result);
     }
 
-    function borrowBalanceStoredInternal2(address account) internal view returns (MathError, uint256, uint256) {
-        (MathError mathErr, uint256 result) = borrowBalanceStoredInternal(account);
-        return (mathErr, result, accountBorrows[account].purePrincipal);
-    }    
+    function borrowGDRBalanceStored(address account) public view returns (uint256) {
+        (MathError err, uint256 result) = borrowGDRBalanceStoredInternal(account);
+        require(err == MathError.NO_ERROR, "PToken: borrowGDRBalanceStoredInternal failed");
+        return result;
+    }
+
+    function borrowGDRBalanceStoredInternal(address account) internal view returns (MathError, uint256) {
+        MathError mathErr;
+        uint256 principalTimesIndex;
+        uint256 gdrPlusPrincipal;
+        uint256 result;
+
+        BorrowSnapshot storage borrowSnapshot = accountBorrows[account];
+
+        if (borrowSnapshot.principal == 0) {
+            return (MathError.NO_ERROR, 0);
+        }
+
+        (mathErr, principalTimesIndex) = mulRtn(borrowSnapshot.principal, borrowGDRIndex);
+        if (mathErr != MathError.NO_ERROR) {
+            return (mathErr, 0);
+        }
+
+        (mathErr, gdrPlusPrincipal) = divRtn(principalTimesIndex, borrowSnapshot.interestGDRIndex);
+        if (mathErr != MathError.NO_ERROR) {
+            return (mathErr, 0);
+        }
+
+        (mathErr, result) = subRtn(gdrPlusPrincipal,borrowSnapshot.principal);
+        if (mathErr != MathError.NO_ERROR) {
+            return (mathErr, 0);
+        }        
+
+        return (MathError.NO_ERROR, result);
+    }
+
+    function supplyBalanceStored(address account) public view returns (uint256) {
+        (MathError err, uint256 result) = supplyBalanceStoredInternal(account);
+        require(err == MathError.NO_ERROR, "PToken: supplyBalanceStoredInternal failed");
+        return result;
+    }
+
+    function supplyBalanceStoredInternal(address account) internal view returns (MathError, uint256) {
+        MathError mathErr;
+        uint256 accountTokenTimesIndex;
+        uint256 result;
+
+        if (accountTokens[account] == 0 || supplyIndex == 0) {
+            return (MathError.NO_ERROR, accountTokens[account]);
+        }
+
+        SupplySnapshot memory accountSupply = accountSupplys[account];
+
+        if (accountSupply.interestIndex == 0) {
+            return (MathError.NO_ERROR, accountTokens[account]);
+        }
+
+        (mathErr, accountTokenTimesIndex) = mulRtn(accountTokens[account], supplyIndex);
+        if (mathErr != MathError.NO_ERROR) {
+            return (mathErr, 0);
+        }
+
+        (mathErr, result) = divRtn(accountTokenTimesIndex, accountSupply.interestIndex);
+        if (mathErr != MathError.NO_ERROR) {
+            return (mathErr, 0);
+        }
+
+        return (MathError.NO_ERROR, result);
+    }     
 
     function getCash() external view returns (uint256) {
         return getCashPrior();
     }
 
     function accrueInterest() public returns (uint256) {
-        uint256 currentBlockNumber = getBlockNumber();
-        uint256 accrualBlockNumberPrior = accrualBlockNumber;
+        uint256 error = accrueBorrowInterest();
+        if (error != uint256(Error.NO_ERROR)) 
+            return error;
 
-        if (accrualBlockNumberPrior == currentBlockNumber) {
+        error = accrueSupplyInterest();
+        if (error != uint256(Error.NO_ERROR)) 
+            return error;
+
+        return uint256(Error.NO_ERROR);
+    }
+
+    function accrueBorrowInterest() internal returns (uint256) {
+        uint256 currentBlockNumber = getBlockNumber();
+        uint256 accrualBorrowBlockNumberPrior = accrualBorrowBlockNumber;
+
+        if (accrualBorrowBlockNumberPrior == currentBlockNumber) {
             return uint256(Error.NO_ERROR);
         }
 
-        uint256 cashPrior = getCashPrior();
-        uint256 borrowsPrior = totalBorrows;
-        uint256 reservesPrior = totalReserves;
-        uint256 borrowIndexPrior = borrowIndex;
+        uint256 currentBlockDays = currentBlockNumber.sub(initalBlockNumber).div(blocksPerDay);
+        uint256 accrualBlockDays = accrualBorrowBlockNumberPrior.sub(initalBlockNumber).div(blocksPerDay);
 
-        uint256 borrowRateMantissa = interestModel.getBorrowRate(cashPrior, borrowsPrior, reservesPrior);
-        require(borrowRateMantissa <= borrowRateMaxMantissa, "PToken: borrow rate is absurdly high");
+        // 하루가 지날 때에만 이자 더해줌...
+        if (currentBlockDays > accrualBlockDays) {
+            uint256 cashPrior = getCashPrior();
 
-        (MathError mathErr, uint256 blockDelta) = subRtn(currentBlockNumber, accrualBlockNumberPrior);
-        require(mathErr == MathError.NO_ERROR, "PToken: could not calculate block delta");
+            uint256 borrowRatePerDayMantissa = interestModel.getBorrowRate(cashPrior, totalBorrows, totalReserves).mul(blocksPerDay);
+            require(borrowRatePerDayMantissa <= borrowRateMaxMantissa, "PToken: borrow rate is absurdly high");
 
-        Exp memory simpleInterestFactor;
-        uint256 interestAccumulated;
-        uint256 totalBorrowsNew;
-        uint256 totalReservesNew;
-        uint256 borrowIndexNew;
+            uint256 borrowRateGDRPerDayMantissa = interestModel.getBorrowRateGDR(cashPrior, totalBorrows, totalReserves).mul(blocksPerDay);
+            require(borrowRateGDRPerDayMantissa <= borrowRateMaxMantissa, "PToken: borrow rate gdr is absurdly high");            
 
-        (mathErr, simpleInterestFactor) = mulExpUintRtn(Exp({mantissa: borrowRateMantissa}), blockDelta);
-        if (mathErr != MathError.NO_ERROR) {
-            return failOpaque(Error.MATH_ERROR, FailureInfo.ACCRUE_INTEREST_SIMPLE_INTEREST_FACTOR_CALCULATION_FAILED, uint256(mathErr));
+            uint256 nDayDelta = currentBlockDays.sub(accrualBlockDays);
+
+            MathError mathErr;
+            uint256 interestAccumulated;
+            uint compoundInterestFactorMantissa = mantissaOne;
+            uint compoundInterestGDRFactorMantissa = mantissaOne;            
+            
+            for (uint i = 0 ; i < nDayDelta ; i++)  {
+                uint onePulsBorrowRatePerDayMantissa = mantissaOne.add(borrowRatePerDayMantissa);
+                (mathErr, compoundInterestFactorMantissa) = mulExpUintTruncRtn(Exp({mantissa:compoundInterestFactorMantissa}), onePulsBorrowRatePerDayMantissa);
+                if (mathErr != MathError.NO_ERROR) {
+                    return failOpaque(Error.MATH_ERROR, FailureInfo.ACCRUE_INTEREST_SIMPLE_INTEREST_FACTOR_CALCULATION_FAILED, uint256(mathErr));
+                }
+            }
+
+            compoundInterestFactorMantissa = compoundInterestFactorMantissa.sub(mantissaOne);
+            Exp memory compountInterestFactor = Exp({mantissa: compoundInterestFactorMantissa});
+
+            for (uint i = 0 ; i < nDayDelta ; i++)  {
+                uint onePulsBorrowRateGDRPerDayMantissa = mantissaOne.add(borrowRateGDRPerDayMantissa);
+                (mathErr, compoundInterestGDRFactorMantissa) = mulExpUintTruncRtn(Exp({mantissa:compoundInterestGDRFactorMantissa}), onePulsBorrowRateGDRPerDayMantissa);
+                if (mathErr != MathError.NO_ERROR) {
+                    return failOpaque(Error.MATH_ERROR, FailureInfo.ACCRUE_INTEREST_SIMPLE_INTEREST_FACTOR_CALCULATION_FAILED, uint256(mathErr));
+                }
+            }
+
+            compoundInterestGDRFactorMantissa = compoundInterestGDRFactorMantissa.sub(mantissaOne);
+            Exp memory compountInterestGDRFactor = Exp({mantissa: compoundInterestGDRFactorMantissa});            
+
+            (mathErr, interestAccumulated) = mulExpUintTruncRtn(compountInterestFactor, totalBorrows);
+            if (mathErr != MathError.NO_ERROR) {
+                return failOpaque(Error.MATH_ERROR, FailureInfo.ACCRUE_INTEREST_ACCUMULATED_INTEREST_CALCULATION_FAILED, uint256(mathErr));
+            }
+
+            (mathErr, totalBorrows) = addRtn(interestAccumulated, totalBorrows);
+            if (mathErr != MathError.NO_ERROR) {
+                return failOpaque(Error.MATH_ERROR, FailureInfo.ACCRUE_INTEREST_NEW_TOTAL_BORROWS_CALCULATION_FAILED, uint256(mathErr));
+            }
+
+            (mathErr, totalReserves) = mulExpUintTruncExpAddUintRtn(Exp({mantissa: reserveFactorMantissa}), interestAccumulated, totalReserves);
+            if (mathErr != MathError.NO_ERROR) {
+                return failOpaque(Error.MATH_ERROR, FailureInfo.ACCRUE_INTEREST_NEW_TOTAL_RESERVES_CALCULATION_FAILED, uint256(mathErr));
+            }
+
+            (mathErr, borrowIndex) = mulExpUintTruncExpAddUintRtn(compountInterestFactor, borrowIndex, borrowIndex);
+            if (mathErr != MathError.NO_ERROR) {
+                return failOpaque(Error.MATH_ERROR, FailureInfo.ACCRUE_INTEREST_NEW_BORROW_INDEX_CALCULATION_FAILED, uint256(mathErr));
+            }
+
+            (mathErr, borrowGDRIndex) = mulExpUintTruncExpAddUintRtn(compountInterestGDRFactor, borrowGDRIndex, borrowGDRIndex);
+            if (mathErr != MathError.NO_ERROR) {
+                return failOpaque(Error.MATH_ERROR, FailureInfo.ACCRUE_INTEREST_NEW_BORROW_INDEX_CALCULATION_FAILED, uint256(mathErr));
+            }            
+
+            emit AccrueBorrowInterest(cashPrior, interestAccumulated, borrowIndex, borrowGDRIndex, totalBorrows);
         }
 
-        (mathErr, interestAccumulated) = mulExpUintTruncRtn(simpleInterestFactor, borrowsPrior);
-        if (mathErr != MathError.NO_ERROR) {
-            return failOpaque(Error.MATH_ERROR, FailureInfo.ACCRUE_INTEREST_ACCUMULATED_INTEREST_CALCULATION_FAILED, uint256(mathErr));
+        accrualBorrowBlockNumber = currentBlockNumber;
+
+        return uint256(Error.NO_ERROR);
+    }
+
+
+    function accrueSupplyInterest() internal returns (uint256) {
+        uint256 currentBlockNumber = getBlockNumber();
+        uint256 accrualSupplyBlockNumberPrior = accrualSupplyBlockNumber;
+
+        if (accrualSupplyBlockNumberPrior == currentBlockNumber) {
+            return uint256(Error.NO_ERROR);
         }
 
-        (mathErr, totalBorrowsNew) = addRtn(interestAccumulated, borrowsPrior);
-        if (mathErr != MathError.NO_ERROR) {
-            return failOpaque(Error.MATH_ERROR, FailureInfo.ACCRUE_INTEREST_NEW_TOTAL_BORROWS_CALCULATION_FAILED, uint256(mathErr));
+        uint256 currentBlockDays = currentBlockNumber.sub(initalBlockNumber).div(blocksPerDay);
+        uint256 accrualBlockDays = accrualSupplyBlockNumberPrior.sub(initalBlockNumber).div(blocksPerDay);
+
+        // 하루가 지날 때에만 이자 더해줌...
+        if (currentBlockDays > accrualBlockDays) {
+            uint256 cashPrior = getCashPrior();
+
+            uint256 supplyRatePerDayMantissa = interestModel.getSupplyRate(cashPrior, totalBorrows, totalReserves, reserveFactorMantissa).mul(blocksPerDay);
+            require(supplyRatePerDayMantissa <= supplyRateMaxMantissa, "PToken: supply rate is absurdly high");
+
+            // 이용률에 따라 suupplyRatePerDay == 0 인 경우가 있으며 이 경우 굳이 이용률을 계산하지 않는다.
+            if (supplyRatePerDayMantissa > 0) { 
+                uint256 nDayDelta = currentBlockDays.sub(accrualBlockDays);
+
+                MathError mathErr;
+                uint256 interestAccumulated;
+                uint compoundInterestFactorMantissa = mantissaOne;
+                
+                for (uint i = 0 ; i < nDayDelta ; i++)  {
+                    uint onePulsSupplyRatePerDayMantissa = mantissaOne.add(supplyRatePerDayMantissa);
+                    (mathErr, compoundInterestFactorMantissa) = mulExpUintTruncRtn(Exp({mantissa:compoundInterestFactorMantissa}), onePulsSupplyRatePerDayMantissa);
+                    if (mathErr != MathError.NO_ERROR) {
+                        return failOpaque(Error.MATH_ERROR, FailureInfo.ACCRUE_INTEREST_SIMPLE_INTEREST_FACTOR_CALCULATION_FAILED, uint256(mathErr));
+                    }
+                }
+
+                compoundInterestFactorMantissa = compoundInterestFactorMantissa.sub(mantissaOne);
+                Exp memory compountInterestFactor = Exp({mantissa: compoundInterestFactorMantissa});
+
+                (mathErr, interestAccumulated) = mulExpUintTruncRtn(compountInterestFactor, totalBorrows);
+                if (mathErr != MathError.NO_ERROR) {
+                    return failOpaque(Error.MATH_ERROR, FailureInfo.ACCRUE_INTEREST_ACCUMULATED_INTEREST_CALCULATION_FAILED, uint256(mathErr));
+                }
+
+                (mathErr, totalSupply) = addRtn(interestAccumulated, totalSupply);
+                if (mathErr != MathError.NO_ERROR) {
+                    return failOpaque(Error.MATH_ERROR, FailureInfo.ACCRUE_INTEREST_NEW_TOTAL_BORROWS_CALCULATION_FAILED, uint256(mathErr));
+                }
+
+                (mathErr, totalReserves) = mulExpUintTruncExpAddUintRtn(Exp({mantissa: reserveFactorMantissa}), interestAccumulated, totalReserves);
+                if (mathErr != MathError.NO_ERROR) {
+                    return failOpaque(Error.MATH_ERROR, FailureInfo.ACCRUE_INTEREST_NEW_TOTAL_RESERVES_CALCULATION_FAILED, uint256(mathErr));
+                }
+
+                (mathErr, supplyIndex) = mulExpUintTruncExpAddUintRtn(compountInterestFactor, supplyIndex, supplyIndex);
+                if (mathErr != MathError.NO_ERROR) {
+                    return failOpaque(Error.MATH_ERROR, FailureInfo.ACCRUE_INTEREST_NEW_BORROW_INDEX_CALCULATION_FAILED, uint256(mathErr));
+                }
+
+                emit AccrueSupplyInterest(cashPrior, interestAccumulated, supplyIndex, totalSupply);
+            }
         }
 
-        (mathErr, totalReservesNew) = mulExpUintTruncExpAddUintRtn(Exp({mantissa: reserveFactorMantissa}), interestAccumulated, reservesPrior);
-        if (mathErr != MathError.NO_ERROR) {
-            return failOpaque(Error.MATH_ERROR, FailureInfo.ACCRUE_INTEREST_NEW_TOTAL_RESERVES_CALCULATION_FAILED, uint256(mathErr));
-        }
-
-        (mathErr, borrowIndexNew) = mulExpUintTruncExpAddUintRtn(simpleInterestFactor, borrowIndexPrior, borrowIndexPrior);
-        if (mathErr != MathError.NO_ERROR) {
-            return failOpaque(Error.MATH_ERROR, FailureInfo.ACCRUE_INTEREST_NEW_BORROW_INDEX_CALCULATION_FAILED, uint256(mathErr));
-        }
-
-        accrualBlockNumber = currentBlockNumber;
-        borrowIndex = borrowIndexNew;
-        totalBorrows = totalBorrowsNew;
-        totalReserves = totalReservesNew;
-
-        emit AccrueInterest(cashPrior, interestAccumulated, borrowIndexNew, totalBorrowsNew);
+        accrualSupplyBlockNumber = currentBlockNumber;
 
         return uint256(Error.NO_ERROR);
     }
@@ -270,6 +473,7 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
         MathError mathErr;
         uint256 mintTokens;
         uint256 totalSupplyNew;
+        uint256 accountTokensBefore;
         uint256 accountTokensNew;
         uint256 actualMintAmount;
     }
@@ -280,7 +484,7 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
             return (failOpaque(Error.PB_ADMIN_REJECTION, FailureInfo.MINT_PB_ADMIN_REJECTION, allowed), 0);
         }
 
-        if (accrualBlockNumber != getBlockNumber()) {
+        if (accrualBorrowBlockNumber != getBlockNumber()) {
             return (fail(Error.MARKET_NOT_FRESH, FailureInfo.MINT_FRESHNESS_CHECK), 0);
         }
 
@@ -293,11 +497,16 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
         (vars.mathErr, vars.totalSupplyNew) = addRtn(totalSupply, vars.mintTokens);
         require(vars.mathErr == MathError.NO_ERROR, "PToken: MINT_NEW_TOTAL_SUPPLY_CALCULATION_FAILED");
 
-        (vars.mathErr, vars.accountTokensNew) = addRtn(accountTokens[minter], vars.mintTokens);
+        (vars.mathErr, vars.accountTokensBefore) = supplyBalanceStoredInternal(minter);
+        require(vars.mathErr == MathError.NO_ERROR, "PToken: MINT_NEW_SUPPLY_ACCUMULATED_BALANCE_CALCULATION_FAILED");        
+
+        (vars.mathErr, vars.accountTokensNew) = addRtn(vars.accountTokensBefore, vars.mintTokens);
         require(vars.mathErr == MathError.NO_ERROR, "PToken: MINT_NEW_ACCOUNT_BALANCE_CALCULATION_FAILED");
 
         totalSupply = vars.totalSupplyNew;
         accountTokens[minter] = vars.accountTokensNew;
+
+        accountSupplys[minter].interestIndex = supplyIndex;
 
         emit Mint(minter, vars.actualMintAmount, vars.mintTokens);
         emit Transfer(address(this), minter, vars.mintTokens);
@@ -320,6 +529,7 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
         uint256 redeemTokens;
         uint256 redeemAmount;
         uint256 totalSupplyNew;
+        uint256 accountTokensBefore;
         uint256 accountTokensNew;
     }
 
@@ -341,7 +551,7 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
             return failOpaque(Error.PB_ADMIN_REJECTION, FailureInfo.REDEEM_PB_ADMIN_REJECTION, allowed);
         }
 
-        if (accrualBlockNumber != getBlockNumber()) {
+        if (accrualBorrowBlockNumber != getBlockNumber()) {
             return fail(Error.MARKET_NOT_FRESH, FailureInfo.REDEEM_FRESHNESS_CHECK);
         }
 
@@ -350,7 +560,12 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
             return failOpaque(Error.MATH_ERROR, FailureInfo.REDEEM_NEW_TOTAL_SUPPLY_CALCULATION_FAILED, uint256(vars.mathErr));
         }
 
-        (vars.mathErr, vars.accountTokensNew) = subRtn(accountTokens[redeemer], vars.redeemTokens);
+        (vars.mathErr, vars.accountTokensBefore) = supplyBalanceStoredInternal(redeemer);
+        if (vars.mathErr != MathError.NO_ERROR) {
+            return failOpaque(Error.MATH_ERROR, FailureInfo.SUPPLY_ACCUMULATED_BALANCE_CALCULATION_FAILED, uint256(vars.mathErr));
+        }
+
+        (vars.mathErr, vars.accountTokensNew) = subRtn(vars.accountTokensBefore, vars.redeemTokens);
         if (vars.mathErr != MathError.NO_ERROR) {
             return failOpaque(Error.MATH_ERROR, FailureInfo.REDEEM_NEW_ACCOUNT_BALANCE_CALCULATION_FAILED, uint256(vars.mathErr));
         }
@@ -363,6 +578,8 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
 
         totalSupply = vars.totalSupplyNew;
         accountTokens[redeemer] = vars.accountTokensNew;
+
+        accountSupplys[redeemer].interestIndex = supplyIndex;       
 
         emit Transfer(redeemer, address(this), vars.redeemTokens);
         emit Redeem(redeemer, vars.redeemAmount, vars.redeemTokens);
@@ -398,7 +615,7 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
             return failOpaque(Error.PB_ADMIN_REJECTION, FailureInfo.BORROW_PB_ADMIN_REJECTION, allowed);
         }
 
-        if (accrualBlockNumber != getBlockNumber()) {
+        if (accrualBorrowBlockNumber != getBlockNumber()) {
             return fail(Error.MARKET_NOT_FRESH, FailureInfo.BORROW_FRESHNESS_CHECK);
         }
 
@@ -427,7 +644,7 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
 
         accountBorrows[borrower].principal = vars.accountBorrowsNew;
         accountBorrows[borrower].interestIndex = borrowIndex;
-        accountBorrows[borrower].purePrincipal =  accountBorrows[borrower].purePrincipal.add(borrowAmount);
+        accountBorrows[borrower].interestGDRIndex = borrowGDRIndex;
         totalBorrows = vars.totalBorrowsNew;
 
         emit Borrow(borrower, borrowAmount, vars.accountBorrowsNew, vars.totalBorrowsNew);
@@ -455,66 +672,71 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
         Error err;
         MathError mathErr;
         uint256 repayAmount;
-        uint256 borrowerIndex;
+        uint256 repayGDRAmount;
         uint256 accountBorrows;
-        uint256 accountPureBorrows;
-        uint256 interestCalculated;
-        uint256 interestInClank;
+        uint256 accountGDRBorrows;
         uint256 accountBorrowsNew;
-        uint256 accountPureBorrowsNew;
         uint256 totalBorrowsNew;
         uint256 actualRepayAmount;
     }
 
-    function repayBorrowFresh(address payer, address borrower, uint256 repayAmount) internal returns (uint256, uint256) {
-        uint256 allowed = pbAdmin.repayBorrowAllowed(address(this), payer, borrower, repayAmount);
+    function repayBorrowFresh(address payer, address borrower, uint repayAmount) internal returns (uint, uint) {
+        uint allowed = pbAdmin.repayBorrowAllowed(address(this), payer, borrower, repayAmount);
         if (allowed != 0) {
             return (failOpaque(Error.PB_ADMIN_REJECTION, FailureInfo.REPAY_BORROW_PB_ADMIN_REJECTION, allowed), 0);
         }
 
-        if (accrualBlockNumber != getBlockNumber()) {
+        if (accrualBorrowBlockNumber != getBlockNumber()) {
             return (fail(Error.MARKET_NOT_FRESH, FailureInfo.REPAY_BORROW_FRESHNESS_CHECK), 0);
         }
 
         RepayBorrowLocalVars memory vars;
 
-        vars.borrowerIndex = accountBorrows[borrower].interestIndex;
-        (vars.mathErr, vars.accountBorrows, vars.accountPureBorrows) = borrowBalanceStoredInternal2(borrower);
+        (vars.mathErr, vars.accountBorrows) = borrowBalanceStoredInternal(borrower);
         if (vars.mathErr != MathError.NO_ERROR) {
-            return (failOpaque(Error.MATH_ERROR, FailureInfo.REPAY_BORROW_ACCUMULATED_BALANCE_CALCULATION_FAILED, uint256(vars.mathErr)), 0);
+            return (failOpaque(Error.MATH_ERROR, FailureInfo.REPAY_BORROW_ACCUMULATED_BALANCE_CALCULATION_FAILED, uint(vars.mathErr)), 0);
         }
 
-        vars.interestCalculated = repayAmount.mul(vars.accountBorrows.sub(vars.accountPureBorrows)).div(vars.accountPureBorrows);
+        if (repayAmount == uint256(-1)) {
+            vars.repayAmount = vars.accountBorrows;
+        } else {
+            vars.repayAmount = repayAmount;
+        }
 
-        bool ret = pbAdmin.clankTransferIn(address(this), payer, vars.interestCalculated);
-        require(ret == true, "PToken: REPAY_BORROW_CLANK_TRANSFER_FAILED");
+        (vars.mathErr, vars.accountGDRBorrows) = borrowGDRBalanceStoredInternal(borrower);
+        if (vars.mathErr != MathError.NO_ERROR) {
+            return (failOpaque(Error.MATH_ERROR, FailureInfo.REPAY_BORROW_ACCUMULATED_BALANCE_CALCULATION_FAILED, uint(vars.mathErr)), 0);
+        }
 
-        vars.repayAmount = repayAmount;
+        if (repayAmount == uint256(-1)) {
+            vars.repayGDRAmount = vars.accountGDRBorrows;
+        } else {
+            /* 전체 대출금액에서 값 비율만큼 실제 부과할 GDR 금액임 */
+            vars.repayGDRAmount = (vars.accountGDRBorrows).mul(repayAmount).div(vars.accountBorrows);
+        }        
+
         vars.actualRepayAmount = doTransferIn(payer, vars.repayAmount);
 
-        (vars.mathErr, vars.accountPureBorrowsNew) = subRtn(vars.accountPureBorrows, vars.actualRepayAmount);
-        require(vars.mathErr == MathError.NO_ERROR, "PToken: REPAY_BORROW_NEW_ACCOUNT_BORROW_BALANCE_CALCULATION_FAILED");
+        (vars.mathErr, vars.accountBorrowsNew) = subRtn(vars.accountBorrows, vars.actualRepayAmount);
+        require(vars.mathErr == MathError.NO_ERROR, "REPAY_BORROW_NEW_ACCOUNT_BORROW_BALANCE_CALCULATION_FAILED");
 
-        if (vars.accountPureBorrowsNew != 0) {
-            (vars.mathErr, vars.accountBorrowsNew) = subRtn((vars.accountBorrows).sub(vars.interestCalculated), vars.actualRepayAmount);
-            require(vars.mathErr == MathError.NO_ERROR, "PToken: REPAY_BORROW_NEW_ACCOUNT_BORROW_BALANCE_CALCULATION_FAILED");
-        }
-        else {
-            vars.accountBorrowsNew = 0;
-        }
+        (vars.mathErr, vars.totalBorrowsNew) = subRtn(totalBorrows, vars.actualRepayAmount);
+        require(vars.mathErr == MathError.NO_ERROR, "REPAY_BORROW_NEW_TOTAL_BALANCE_CALCULATION_FAILED");
 
-        (vars.mathErr, vars.totalBorrowsNew) = subRtn(totalBorrows, vars.actualRepayAmount.add(vars.interestCalculated));        
-        require(vars.mathErr == MathError.NO_ERROR, "PToken: REPAY_BORROW_NEW_TOTAL_BALANCE_CALCULATION_FAILED");
+        bool clankWithdrawRet = pbAdmin.clankTransferIn(address(this), payer, vars.repayGDRAmount);
+
+        require(clankWithdrawRet == true, "clank withdraw failed");
 
         accountBorrows[borrower].principal = vars.accountBorrowsNew;
-        accountBorrows[borrower].purePrincipal = vars.accountPureBorrowsNew;
         accountBorrows[borrower].interestIndex = borrowIndex;
+        accountBorrows[borrower].interestGDRIndex = borrowGDRIndex;
         totalBorrows = vars.totalBorrowsNew;
 
         emit RepayBorrow(payer, borrower, vars.actualRepayAmount, vars.accountBorrowsNew, vars.totalBorrowsNew);
 
-        return (uint256(Error.NO_ERROR), vars.actualRepayAmount);
+        return (uint(Error.NO_ERROR), vars.actualRepayAmount);
     }
+
 
     function liquidateBorrowInternal(address borrower, uint256 repayAmount, PTokenInterface pTokenCollateral) internal nonReentrant returns (uint256, uint256) {
         uint256 error = accrueInterest();
@@ -536,11 +758,12 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
             return (failOpaque(Error.PB_ADMIN_REJECTION, FailureInfo.LIQUIDATE_PB_ADMIN_REJECTION, allowed), 0);
         }
 
-        if (accrualBlockNumber != getBlockNumber()) {
+        if (accrualBorrowBlockNumber != getBlockNumber()) {
             return (fail(Error.MARKET_NOT_FRESH, FailureInfo.LIQUIDATE_FRESHNESS_CHECK), 0);
         }
 
-        if (pTokenCollateral.accrualBlockNumber() != getBlockNumber()) {
+        if (pTokenCollateral.accrualBorrowBlockNumber() != getBlockNumber()) 
+        {
             return (fail(Error.MARKET_NOT_FRESH, FailureInfo.LIQUIDATE_COLLATERAL_FRESHNESS_CHECK), 0);
         }
 
@@ -552,7 +775,7 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
             return (fail(Error.INVALID_CLOSE_AMOUNT_REQUESTED, FailureInfo.LIQUIDATE_CLOSE_AMOUNT_IS_ZERO), 0);
         }
 
-        if (repayAmount == uint(-1)) {
+        if (repayAmount == uint256(-1)) {
             return (fail(Error.INVALID_CLOSE_AMOUNT_REQUESTED, FailureInfo.LIQUIDATE_CLOSE_AMOUNT_IS_UINT_MAX), 0);
         }
 
@@ -585,6 +808,8 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
 
     struct SeizeInternalLocalVars {
         MathError mathErr;
+        uint256 borrowerTokensBefore;
+        uint256 liquidatorTokensBefore;
         uint256 borrowerTokensNew;
         uint256 liquidatorTokensNew;
         uint256 liquidatorSeizeTokens;
@@ -606,7 +831,12 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
 
         SeizeInternalLocalVars memory vars;
 
-        (vars.mathErr, vars.borrowerTokensNew) = subRtn(accountTokens[borrower], seizeTokens);
+        (vars.mathErr, vars.borrowerTokensBefore) = supplyBalanceStoredInternal(borrower);
+        if (vars.mathErr != MathError.NO_ERROR) {
+            return failOpaque(Error.MATH_ERROR, FailureInfo.SUPPLY_ACCUMULATED_BALANCE_CALCULATION_FAILED, uint256(vars.mathErr));
+        }        
+
+        (vars.mathErr, vars.borrowerTokensNew) = subRtn(vars.borrowerTokensBefore, seizeTokens);
         if (vars.mathErr != MathError.NO_ERROR) {
             return failOpaque(Error.MATH_ERROR, FailureInfo.LIQUIDATE_SEIZE_BALANCE_DECREMENT_FAILED, uint256(vars.mathErr));
         }
@@ -619,7 +849,12 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
         vars.totalReservesNew = totalReserves.add(vars.protocolSeizeAmount);
         vars.totalSupplyNew = totalSupply.sub(vars.protocolSeizeTokens);
 
-        (vars.mathErr, vars.liquidatorTokensNew) = addRtn(accountTokens[liquidator], vars.liquidatorSeizeTokens);
+        (vars.mathErr, vars.liquidatorTokensBefore) = supplyBalanceStoredInternal(liquidator);
+        if (vars.mathErr != MathError.NO_ERROR) {
+            return failOpaque(Error.MATH_ERROR, FailureInfo.SUPPLY_ACCUMULATED_BALANCE_CALCULATION_FAILED, uint256(vars.mathErr));
+        }  
+
+        (vars.mathErr, vars.liquidatorTokensNew) = addRtn(vars.liquidatorTokensBefore, vars.liquidatorSeizeTokens);
         if (vars.mathErr != MathError.NO_ERROR) {
             return failOpaque(Error.MATH_ERROR, FailureInfo.LIQUIDATE_SEIZE_BALANCE_INCREMENT_FAILED, uint256(vars.mathErr));
         }
@@ -628,6 +863,9 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
         totalSupply = vars.totalSupplyNew;
         accountTokens[borrower] = vars.borrowerTokensNew;
         accountTokens[liquidator] = vars.liquidatorTokensNew;
+
+        accountSupplys[borrower].interestIndex = supplyIndex;
+        accountSupplys[liquidator].interestIndex = supplyIndex;
 
         emit Transfer(borrower, liquidator, vars.liquidatorSeizeTokens);
         emit Transfer(borrower, address(this), vars.protocolSeizeTokens);
@@ -680,9 +918,11 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
 
         PBAdminInterface oldPBAdmin = pbAdmin;
         require(newPBAdmin.isPBAdmin(), "PToken: marker method returned false");
+
         pbAdmin = newPBAdmin;
 
         emit NewPBAdmin(oldPBAdmin, newPBAdmin);
+
         return uint256(Error.NO_ERROR);
     }
 
@@ -699,7 +939,7 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
             return fail(Error.UNAUTHORIZED, FailureInfo.SET_RESERVE_FACTOR_ADMIN_CHECK);
         }
 
-        if (accrualBlockNumber != getBlockNumber()) {
+        if (accrualBorrowBlockNumber != getBlockNumber()) {
             return fail(Error.MARKET_NOT_FRESH, FailureInfo.SET_RESERVE_FACTOR_FRESH_CHECK);
         }
 
@@ -729,7 +969,7 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
         uint256 totalReservesNew;
         uint256 actualAddAmount;
 
-        if (accrualBlockNumber != getBlockNumber()) {
+        if (accrualBorrowBlockNumber != getBlockNumber()) {
             return (fail(Error.MARKET_NOT_FRESH, FailureInfo.ADD_RESERVES_FRESH_CHECK), actualAddAmount);
         }
 
@@ -761,7 +1001,7 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
             return fail(Error.UNAUTHORIZED, FailureInfo.REDUCE_RESERVES_ADMIN_CHECK);
         }
 
-        if (accrualBlockNumber != getBlockNumber()) {
+        if (accrualBorrowBlockNumber != getBlockNumber()) {
             return fail(Error.MARKET_NOT_FRESH, FailureInfo.REDUCE_RESERVES_FRESH_CHECK);
         }
 
@@ -800,7 +1040,7 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
             return fail(Error.UNAUTHORIZED, FailureInfo.SET_INTEREST_RATE_MODEL_OWNER_CHECK);
         }
 
-        if (accrualBlockNumber != getBlockNumber()) {
+        if (accrualBorrowBlockNumber != getBlockNumber()) {
             return fail(Error.MARKET_NOT_FRESH, FailureInfo.SET_INTEREST_RATE_MODEL_FRESH_CHECK);
         }
 
@@ -815,7 +1055,7 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
 
     function getCashPrior() internal view returns (uint256);
     function doTransferIn(address from, uint256 amount) internal returns (uint256);
-    function doTransferOut(address payable to, uint256 amount) internal;
+    function doTransferOut(address to, uint256 amount) internal;
 
     modifier nonReentrant() {
         require(_notEntered, "PToken: re-entered");
