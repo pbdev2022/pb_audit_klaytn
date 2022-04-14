@@ -59,7 +59,7 @@ contract PTokenStorage {
     mapping(address => SupplySnapshot) internal accountSupplys;
 
     uint256 public constant protocolSeizeShareMantissa = 2.8e16; //2.8%
-    uint256 public constant blocksPerDay = 5760;
+    uint256 public constant blocksPerDay = 86400;
 }
 
 contract PTokenInterface is PTokenStorage {
