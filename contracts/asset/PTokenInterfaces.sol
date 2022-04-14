@@ -17,8 +17,8 @@ contract PTokenStorage {
     uint256 internal constant borrowRateGDRMaxMantissa = 0.0005e16;    
     uint256 internal constant reserveFactorMaxMantissa = 1e18;
 
-    address public admin;
-    address public pendingAdmin;
+    address payable public admin;
+    address payable public pendingAdmin;
 
     PBAdminInterface public pbAdmin;
 
@@ -122,7 +122,7 @@ contract PErc20Interface is PErc20Storage {
     function repayBorrow(uint256 repayAmount) external returns (uint256);
     function repayBorrowBehalf(address borrower, uint256 repayAmount) external returns (uint256);
     function liquidateBorrow(address borrower, uint256 repayAmount, PTokenInterface pTokenCollateral) external returns (uint256);
-    function sweepToken(EIP20Interface token) external;
+    function sweepToken(EIP20Interface token) external; 
 
     function _addReserves(uint256 addAmount) external returns (uint256);
 }
