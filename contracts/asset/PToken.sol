@@ -179,6 +179,10 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
         return interestModel.getBorrowRate(getCashPrior(), totalBorrows, totalReserves);
     }
 
+    function borrowRateGDRPerBlock() public view returns (uint256) {    
+        return interestModel.getBorrowRateGDR(getCashPrior(), totalBorrows, totalReserves);
+    }
+
     function supplyRatePerBlock() public view returns (uint256) {    
         return interestModel.getSupplyRate(getCashPrior(), totalBorrows, totalReserves, reserveFactorMantissa);
     }
@@ -198,6 +202,12 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
         require(err == MathError.NO_ERROR, "PT:borrowBalanceStored");
         return result;
     }
+
+    function borrowBalancePrincipalWithInterest(address account) public view returns (uint256, uint256) {
+        (MathError err, uint256 result) = borrowBalanceStoredInternal(account);
+        require(err == MathError.NO_ERROR, "PT:borrowBalanceStored");
+        return (accountBorrows[account].principal, result - accountBorrows[account].principal);
+    }    
 
     function borrowBalanceStoredInternal(address account) internal view returns (MathError, uint256) {
         MathError mathErr;
@@ -265,6 +275,12 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
         return result;
     }
 
+    function supplyBalancePrincipalWithInterest(address account) public view returns (uint256, uint256) {
+        (MathError err, uint256 result) = supplyBalanceStoredInternal(account);
+        require(err == MathError.NO_ERROR, "PT:supplyBalancePrincipalWithInterest");
+        return (accountTokens[account], (result-accountTokens[account]));
+    }
+
     function supplyBalanceStoredInternal(address account) internal view returns (MathError, uint256) {
         MathError mathErr;
         uint256 accountTokenTimesIndex;
@@ -298,11 +314,11 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
     }
 
     function accrueInterest() public returns (uint256) {
-        uint256 error = accrueBorrowInterest();
+        uint256 error = accrueSupplyInterest();
         if (error != uint256(Error.NO_ERROR)) 
             return error;
 
-        error = accrueSupplyInterest();
+        error = accrueBorrowInterest();
         if (error != uint256(Error.NO_ERROR)) 
             return error;
 
@@ -325,10 +341,10 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
             uint256 cashPrior = getCashPrior();
 
             uint256 borrowRatePerDayMantissa = interestModel.getBorrowRate(cashPrior, totalBorrows, totalReserves).mul(blocksPerDay);
-            require(borrowRatePerDayMantissa <= borrowRateMaxMantissa, "PT:accrueBorrowInterest(01)");
+            require(borrowRatePerDayMantissa <= borrowRateMaxMantissa.mul(blocksPerDay), "PT:accrueBorrowInterest(01)");
 
             uint256 borrowRateGDRPerDayMantissa = interestModel.getBorrowRateGDR(cashPrior, totalBorrows, totalReserves).mul(blocksPerDay);
-            require(borrowRateGDRPerDayMantissa <= borrowRateMaxMantissa, "PT:accrueBorrowInterest(02)");
+            require(borrowRateGDRPerDayMantissa <= borrowRateMaxMantissa.mul(blocksPerDay), "PT:accrueBorrowInterest(02)");
 
             uint256 nDayDelta = currentBlockDays.sub(accrualBlockDays);
 
@@ -409,7 +425,7 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
             uint256 cashPrior = getCashPrior();
 
             uint256 supplyRatePerDayMantissa = interestModel.getSupplyRate(cashPrior, totalBorrows, totalReserves, reserveFactorMantissa).mul(blocksPerDay);
-            require(supplyRatePerDayMantissa <= supplyRateMaxMantissa, "PT:accrueSupplyInterest");
+            require(supplyRatePerDayMantissa <= supplyRateMaxMantissa.mul(blocksPerDay), "PT:accrueSupplyInterest");
 
             // 이용률에 따라 suupplyRatePerDay == 0 인 경우가 있으며 이 경우 굳이 이용률을 계산하지 않는다.
             if (supplyRatePerDayMantissa > 0) { 
@@ -430,7 +446,7 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
                 compoundInterestFactorMantissa = compoundInterestFactorMantissa.sub(mantissaOne);
                 Exp memory compountInterestFactor = Exp({mantissa: compoundInterestFactorMantissa});
 
-                (mathErr, interestAccumulated) = mulExpUintTruncRtn(compountInterestFactor, totalBorrows);
+                (mathErr, interestAccumulated) = mulExpUintTruncRtn(compountInterestFactor, totalSupply);
                 if (mathErr != MathError.NO_ERROR) {
                     return failOpaque(Error.MATH_ERROR, FailureInfo.ACCRUE_INTEREST_ACCUMULATED_INTEREST_CALCULATION_FAILED, uint256(mathErr));
                 }
@@ -438,11 +454,6 @@ contract PToken is PTokenInterface, ExpMath, ExpMathRtn, TokenErrorReporter {
                 (mathErr, totalSupply) = addRtn(interestAccumulated, totalSupply);
                 if (mathErr != MathError.NO_ERROR) {
                     return failOpaque(Error.MATH_ERROR, FailureInfo.ACCRUE_INTEREST_NEW_TOTAL_BORROWS_CALCULATION_FAILED, uint256(mathErr));
-                }
-
-                (mathErr, totalReserves) = mulExpUintTruncExpAddUintRtn(Exp({mantissa: reserveFactorMantissa}), interestAccumulated, totalReserves);
-                if (mathErr != MathError.NO_ERROR) {
-                    return failOpaque(Error.MATH_ERROR, FailureInfo.ACCRUE_INTEREST_NEW_TOTAL_RESERVES_CALCULATION_FAILED, uint256(mathErr));
                 }
 
                 (mathErr, supplyIndex) = mulExpUintTruncExpAddUintRtn(compountInterestFactor, supplyIndex, supplyIndex);

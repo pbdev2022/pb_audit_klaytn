@@ -91,12 +91,15 @@ contract PTokenInterface is PTokenStorage {
     function balanceOfUnderlying(address owner) external view returns (uint256);
     function getAccountSnapshot(address account) external view returns (uint256, uint256, uint256, uint256);
     function borrowRatePerBlock() public view returns (uint256);
+    function borrowRateGDRPerBlock() public view returns (uint256);
     function supplyRatePerBlock() public view returns (uint256);
     function totalBorrowsCurrent() external returns (uint256);
     function borrowBalanceCurrent(address account) external returns (uint256);
     function borrowBalanceStored(address account) public view returns (uint256);
+    function borrowBalancePrincipalWithInterest(address account) public view returns (uint256, uint256);
     function borrowGDRBalanceStored(address account) public view returns (uint256);
     function supplyBalanceStored(address account) public view returns (uint256);
+    function supplyBalancePrincipalWithInterest(address account) public view returns (uint256, uint256);
     function getCash() external view returns (uint256);
     function accrueInterest() public returns (uint256);    
     function seize(address liquidator, address borrower, uint256 seizeTokens) external returns (uint256);

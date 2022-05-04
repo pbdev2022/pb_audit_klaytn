@@ -10,7 +10,7 @@ contract PBOracle is PriceOracle {
 
     function _getUnderlyingAddress(PToken pToken) private view returns (address) {
         address asset;
-        if (compareStrings(pToken.symbol(), "pETH")) {
+        if (compareStrings(pToken.symbol(), "pKLAY")) {
             asset = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
         } else {
             asset = address(PErc20(address(pToken)).underlying());
